@@ -1,8 +1,7 @@
 name: Scan
 
+# Расписание временно отключено. Ручной запуск через workflow_dispatch остаётся доступен.
 on:
-  schedule:
-    - cron: "2 */2 * * *"  # каждые 2 часа в :02 (UTC); свечи 4ч закрываются в 00, 04, 08, 12, 16, 20 UTC
   workflow_dispatch:
     inputs:
       test_telegram:
