@@ -1,6 +1,7 @@
 """Hourly OKX market-structure scanner. Public-data only; no trading endpoints."""
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import os
@@ -195,6 +196,11 @@ def prune_state(state: dict) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Scan OKX market structure")
+    parser.add_argument("--dry-run", action="store_true", help="Print notifications without sending them")
+    args = parser.parse_args()
+    if args.dry_run:
+        os.environ["DRY_RUN"] = "1"
     if os.environ.get("TEST_TELEGRAM") == "1":
         ok = telegram_send("✅ Market Structure Scanner: Telegram connection works.")
         return 0 if ok else 1
