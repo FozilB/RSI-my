@@ -61,6 +61,8 @@ def find_bearish_confirmations(
     atr_period: int = 14,
     atr_tolerance: float = 0.20,
     min_tolerance_pct: float = 0.001,
+    setup_max_bars: int = 60,
+    retest_max_bars: int = 12,
 ) -> list[dict]:
     """Find completed bearish CHoCH -> LH -> BOS -> retest sequences.
 
@@ -82,6 +84,16 @@ def find_bearish_confirmations(
     for i, candle in enumerate(candles):
         for pivot in by_confirmation.get(i, []):
             (highs if pivot["kind"] == "high" else lows).append(pivot)
+
+        # Схема сломана или устарела -> сброс, чтобы не пропустить следующую, правильную схему.
+        # После CHoCH: закрытие выше прежнего HH. После LH: закрытие выше LH. Плюс лимиты по времени.
+        if stage != "trend":
+            ceiling = lh_price if lh_price is not None else high_reference
+            too_old = i - choch_index > setup_max_bars
+            retest_late = stage == "retest" and i - bos_index > retest_max_bars
+            if candle["c"] > ceiling or too_old or retest_late:
+                stage = "trend"
+                high_reference = choch_index = interim_low = lh_index = bos_index = bos_level = lh_price = None
 
         if stage == "trend":
             if len(highs) < 2 or len(lows) < 2:

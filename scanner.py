@@ -199,6 +199,8 @@ def scan(state: dict) -> dict:
                 atr_period=C.ATR_PERIOD,
                 atr_tolerance=C.RETEST_ATR_TOLERANCE,
                 min_tolerance_pct=C.MIN_RETEST_TOLERANCE_PCT,
+                setup_max_bars=C.SETUP_MAX_BARS,
+                retest_max_bars=C.RETEST_MAX_BARS,
             )
             for event in events:
                 signal_ts = candles[event["retest_index"]]["ts"]
