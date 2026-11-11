@@ -95,6 +95,15 @@ def format_price(value: float) -> str:
     return f"{value:.10f}".rstrip("0").rstrip(".")
 
 
+def plan_price(value: float) -> str:
+    """Цена уровня плана: 5 значащих цифр (191.59, 0.0012346), без хвоста из лишних знаков."""
+    if value <= 0:
+        return format_price(value)
+    import math
+    digits = max(0, 4 - int(math.floor(math.log10(value))))
+    return f"{value:.{digits}f}"
+
+
 def trade_levels(entry: float, stop_above: float) -> dict | None:
     """Уровни шорта: стоп чуть выше LH, тейки кратны риску. None - вход не ниже стопа."""
     sl = stop_above * (1 + C.SL_BUFFER_PCT / 100)
@@ -118,13 +127,13 @@ def trade_plan_text(entry: float, stop_above: float) -> str:
     lines = [
         "",
         "📉 План сделки (шорт, фьючерс)",
-        f"Вход: {format_price(t['entry'])} (закрытие свечи ретеста)",
-        f"Стоп-лосс: {format_price(t['sl'])} ({pct(t['sl'])}) — выше LH",
-        f"Тейк 1: {format_price(t['tp1'])} ({pct(t['tp1'])}) — закрыть половину, стоп перенести в точку входа",
-        f"Тейк 2: {format_price(t['tp2'])} ({pct(t['tp2'])}) — закрыть остаток",
+        f"Вход: {plan_price(t['entry'])} (закрытие свечи ретеста)",
+        f"Стоп-лосс: {plan_price(t['sl'])} ({pct(t['sl'])}) — выше LH",
+        f"Тейк 1: {plan_price(t['tp1'])} ({pct(t['tp1'])}) — закрыть половину, стоп перенести в точку входа",
+        f"Тейк 2: {plan_price(t['tp2'])} ({pct(t['tp2'])}) — закрыть остаток",
         f"Объём позиции: ~{size:,.0f} USDT (при стопе потеря ≈ {C.RISK_USDT:g} USDT)",
-        f"Не входить, если цена уже ниже {format_price(t['entry'] - t['risk'] * C.MAX_CHASE_R)} "
-        f"или выше {format_price(t['sl'])}",
+        f"Не входить, если цена уже ниже {plan_price(t['entry'] - t['risk'] * C.MAX_CHASE_R)} "
+        f"или выше {plan_price(t['sl'])}",
     ]
     if t["risk_pct"] > C.MAX_RISK_PCT:
         lines.append(f"⚠️ Широкий стоп ({t['risk_pct']:.1f}%): лучше пропустить.")
