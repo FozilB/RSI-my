@@ -76,7 +76,7 @@ def find_bearish_confirmations(
     stage = "trend"
     high_reference = choch_index = None
     interim_low = lh_index = bos_index = None
-    bos_level = None
+    bos_level = lh_price = None
     output = []
 
     for i, candle in enumerate(candles):
@@ -107,6 +107,7 @@ def find_bearish_confirmations(
                            and p["price"] < high_reference), None)
                 if lh:
                     lh_index = lh["index"]
+                    lh_price = lh["price"]
                     bos_level = interim_low["price"]
                     stage = "after_lh"
 
@@ -127,10 +128,11 @@ def find_bearish_confirmations(
                     "bos_index": bos_index,
                     "retest_index": i,
                     "bos_level": bos_level,
+                    "lh_price": lh_price,
                     "tolerance": tolerance,
                     "swing_labels": ["HH", "HL", "LH", "LL"],
                 })
                 stage = "trend"
-                high_reference = choch_index = interim_low = lh_index = bos_index = bos_level = None
+                high_reference = choch_index = interim_low = lh_index = bos_index = bos_level = lh_price = None
 
     return output

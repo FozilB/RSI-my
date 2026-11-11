@@ -95,6 +95,43 @@ def format_price(value: float) -> str:
     return f"{value:.10f}".rstrip("0").rstrip(".")
 
 
+def trade_levels(entry: float, stop_above: float) -> dict | None:
+    """Уровни шорта: стоп чуть выше LH, тейки кратны риску. None - вход не ниже стопа."""
+    sl = stop_above * (1 + C.SL_BUFFER_PCT / 100)
+    risk = sl - entry
+    if risk <= 0:
+        return None
+    return {"entry": entry, "sl": sl, "risk": risk, "risk_pct": risk / entry * 100,
+            "tp1": entry - risk * C.TP1_R, "tp2": entry - risk * C.TP2_R}
+
+
+def trade_plan_text(entry: float, stop_above: float) -> str:
+    """Блок «План сделки». Только подсказка: бот сам ордера не ставит."""
+    t = trade_levels(entry, stop_above)
+    if t is None:
+        return ""
+
+    def pct(x: float) -> str:
+        return f"{(x / t['entry'] - 1) * 100:+.2f}%"
+
+    size = C.RISK_USDT / (t["risk_pct"] / 100)
+    lines = [
+        "",
+        "📉 План сделки (шорт, фьючерс)",
+        f"Вход: {format_price(t['entry'])} (закрытие свечи ретеста)",
+        f"Стоп-лосс: {format_price(t['sl'])} ({pct(t['sl'])}) — выше LH",
+        f"Тейк 1: {format_price(t['tp1'])} ({pct(t['tp1'])}) — закрыть половину, стоп перенести в точку входа",
+        f"Тейк 2: {format_price(t['tp2'])} ({pct(t['tp2'])}) — закрыть остаток",
+        f"Объём позиции: ~{size:,.0f} USDT (при стопе потеря ≈ {C.RISK_USDT:g} USDT)",
+        f"Не входить, если цена уже ниже {format_price(t['entry'] - t['risk'] * C.MAX_CHASE_R)} "
+        f"или выше {format_price(t['sl'])}",
+    ]
+    if t["risk_pct"] > C.MAX_RISK_PCT:
+        lines.append(f"⚠️ Широкий стоп ({t['risk_pct']:.1f}%): лучше пропустить.")
+    lines.append("Это подсказка, не гарантия. Без стоп-лосса не входить.")
+    return "\n".join(lines) + "\n"
+
+
 def message_for(inst_id: str, timeframe: str, candles: list[dict], event: dict) -> str:
     index = event["retest_index"]
     candle = candles[index]
@@ -102,13 +139,15 @@ def message_for(inst_id: str, timeframe: str, candles: list[dict], event: dict) 
     base = inst_id.removesuffix("-USDT-SWAP")
     chart_tf = {"30m": "30", "1h": "60", "4h": "240"}[timeframe]
     chart = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={chart_tf}"
+    plan = trade_plan_text(candle["c"], event["lh_price"]) if C.TRADE_PLAN and event.get("lh_price") else ""
     return (
         f"🔻 Market Structure Scanner · {base}/USDT\n\n"
         f"Таймфрейм: {timeframe}\n"
         f"Подтверждение: CHoCH → LH → BOS → ретест\n"
         f"Уровень BOS: {format_price(event['bos_level'])}\n"
         f"Ретест закрытой свечи: {format_time(ts + C.TIMEFRAMES[timeframe]["milliseconds"])} (Ташкент)\n"
-        f"Закрытие: {format_price(candle['c'])}\n\n"
+        f"Закрытие: {format_price(candle['c'])}\n"
+        f"{plan}\n"
         f"График: {chart}"
     )
 
