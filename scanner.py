@@ -107,7 +107,7 @@ def message_for(inst_id: str, timeframe: str, candles: list[dict], event: dict) 
         f"Таймфрейм: {timeframe}\n"
         f"Подтверждение: CHoCH → LH → BOS → ретест\n"
         f"Уровень BOS: {format_price(event['bos_level'])}\n"
-        f"Ретест закрытой свечи: {format_time(ts)} (Ташкент)\n"
+        f"Ретест закрытой свечи: {format_time(ts + C.TIMEFRAMES[timeframe]["milliseconds"])} (Ташкент)\n"
         f"Закрытие: {format_price(candle['c'])}\n\n"
         f"График: {chart}"
     )
