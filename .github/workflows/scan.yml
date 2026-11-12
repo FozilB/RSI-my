@@ -1,8 +1,10 @@
 name: Market Structure Scan
 
 on:
+  # Резервный запуск. Основной режим - цепочка: каждый запуск сам ставит следующий,
+  # потому что расписание GitHub на деле срабатывало раз в ~8 часов вместо каждого часа.
   schedule:
-    - cron: "7 * * * *"
+    - cron: "11,41 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -14,8 +16,15 @@ on:
         type: boolean
         default: false
 
+# Интервал цепочки: сразу после закрытия каждой 30m-свечи (в :01 и :31 UTC)
+env:
+  RUN_EVERY_MIN: "30"
+  OFFSET_SEC: "60"
+
+# actions: write нужен, чтобы запуск мог поставить следующий запуск (цепочка)
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: market-structure-scan
@@ -46,6 +55,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          SCAN_ALL: ${{ inputs.dry_run && '1' || '' }}
           TEST_TELEGRAM: ${{ inputs.test_telegram && '1' || '' }}
       - name: Save scanner state
         if: always()
@@ -53,3 +63,34 @@ jobs:
         with:
           path: state
           key: market-structure-state-${{ github.run_id }}
+
+      - name: Следующий запуск (цепочка)
+        # Следующий запуск ставится сразу и ждёт в очереди (concurrency), пока этот не закончится.
+        # Этот запуск досыпает до ближайшего :01/:31 UTC и завершается - следующий стартует ровно после закрытия свечи.
+        # Если цепочка оборвётся, её восстановит запуск по расписанию.
+        # Тестовые и пробные запуски цепочку не продолжают.
+        if: ${{ !cancelled() && !inputs.test_telegram && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          queued=0
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if gh workflow run scan.yml --ref "${{ github.ref_name }}"; then
+              echo "Следующий запуск поставлен в очередь (попытка $attempt)"
+              queued=1
+              break
+            fi
+            echo "Попытка $attempt не удалась, повтор через 30 с"
+            sleep 30
+          done
+          if [ "$queued" != "1" ]; then
+            echo "Не удалось поставить следующий запуск. Цепочку восстановит запуск по расписанию."
+            exit 1
+          fi
+          now=$(date +%s)
+          period=$(( RUN_EVERY_MIN * 60 ))
+          next=$(( ( (now - OFFSET_SEC + period - 1) / period ) * period + OFFSET_SEC ))
+          wait=$(( next - now ))
+          echo "Жду ${wait} с: следующий скан начнётся в $(date -d @${next} +%H:%M) UTC"
+          sleep "$wait"
