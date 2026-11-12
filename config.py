@@ -15,6 +15,9 @@ RETEST_MAX_BARS = 12     # ретест не позже стольких све�
 REQUEST_PAUSE_SECONDS = 0.12
 REQUEST_TIMEOUT_SECONDS = 20
 MAX_RETRIES = 3
+MAX_SIGNAL_AGE_MIN = 25  # сигнал старше стольких минут после закрытия свечи ретеста не отправляется
+DUE_WINDOW_MIN = 25      # 1h/4h сканируются только в первые N минут после закрытия их свечи
+SKIP_IF_CHASE = True     # не отправлять, если текущая цена уже вне зоны входа (ниже «не догонять» или выше стопа)
 STATE_FILE = "state/state.json"
 STATE_RETENTION_DAYS = 30
 

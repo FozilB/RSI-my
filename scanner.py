@@ -141,7 +141,33 @@ def trade_plan_text(entry: float, stop_above: float) -> str:
     return "\n".join(lines) + "\n"
 
 
-def message_for(inst_id: str, timeframe: str, candles: list[dict], event: dict) -> str:
+def entry_status(entry: float, stop_above: float, current: float) -> str:
+    """'ok' - цена в зоне входа; 'chased' - уже ушла вниз дальше MAX_CHASE_R; 'stopped' - выше стопа."""
+    t = trade_levels(entry, stop_above)
+    if t is None:
+        return "ok"
+    if current >= t["sl"]:
+        return "stopped"
+    if current < t["entry"] - t["risk"] * C.MAX_CHASE_R:
+        return "chased"
+    return "ok"
+
+
+def signal_age_min(timeframe: str, candle_ts: int, now_ms: int) -> float:
+    close_ts = candle_ts + C.TIMEFRAMES[timeframe]["milliseconds"]
+    return (now_ms - close_ts) / 60000
+
+
+def timeframe_due(timeframe: str, now_ms: int) -> bool:
+    """30m сканируется всегда; 1h/4h - только в первые DUE_WINDOW_MIN минут после закрытия их свечи."""
+    if timeframe == "30m" or os.environ.get("SCAN_ALL") == "1":
+        return True
+    period = C.TIMEFRAMES[timeframe]["milliseconds"]
+    return now_ms % period < C.DUE_WINDOW_MIN * 60000
+
+
+def message_for(inst_id: str, timeframe: str, candles: list[dict], event: dict,
+                current: float | None = None, now_ms: int | None = None) -> str:
     index = event["retest_index"]
     candle = candles[index]
     ts = candle["ts"]
@@ -149,6 +175,10 @@ def message_for(inst_id: str, timeframe: str, candles: list[dict], event: dict) 
     chart_tf = {"30m": "30", "1h": "60", "4h": "240"}[timeframe]
     chart = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={chart_tf}"
     plan = trade_plan_text(candle["c"], event["lh_price"]) if C.TRADE_PLAN and event.get("lh_price") else ""
+    now_line = ""
+    if current is not None:
+        age = f" · сигналу {signal_age_min(timeframe, ts, now_ms):.0f} мин" if now_ms is not None else ""
+        now_line = f"Сейчас: {format_price(current)} ({(current / candle['c'] - 1) * 100:+.2f}% от входа){age}\n"
     return (
         f"🔻 Market Structure Scanner · {base}/USDT\n\n"
         f"Таймфрейм: {timeframe}\n"
@@ -156,6 +186,7 @@ def message_for(inst_id: str, timeframe: str, candles: list[dict], event: dict) 
         f"Уровень BOS: {format_price(event['bos_level'])}\n"
         f"Ретест закрытой свечи: {format_time(ts + C.TIMEFRAMES[timeframe]["milliseconds"])} (Ташкент)\n"
         f"Закрытие: {format_price(candle['c'])}\n"
+        f"{now_line}"
         f"{plan}\n"
         f"График: {chart}"
     )
@@ -185,10 +216,13 @@ def telegram_send(text: str) -> bool:
 
 
 def scan(state: dict) -> dict:
-    stats = {"instruments": 0, "candles": 0, "signals": 0, "errors": 0}
+    stats = {"instruments": 0, "candles": 0, "signals": 0, "errors": 0, "stale": 0, "chased": 0}
     instruments = fetch_instruments()
     log(f"Found {len(instruments)} USDT perpetual instruments on OKX")
     for timeframe, settings in C.TIMEFRAMES.items():
+        if not timeframe_due(timeframe, int(time.time() * 1000)):
+            log(f"{timeframe}: skipped (its candle did not just close)")
+            continue
         for inst_id in instruments:
             state_key = f"{inst_id}|{timeframe}"
             candles_all = fetch_candles(inst_id, settings["okx"])
@@ -215,12 +249,27 @@ def scan(state: dict) -> dict:
                 signal_ts = candles[event["retest_index"]]["ts"]
                 is_new = signal_ts > previous_ts if previous_ts is not None else event["retest_index"] == len(candles) - 1
                 key = signal_key(inst_id, timeframe, signal_ts)
-                if is_new and key not in state["sent"]:
-                    state["pending"].setdefault(key, {
-                        "message": message_for(inst_id, timeframe, candles, event),
-                        "created_at": int(time.time() * 1000),
-                    })
-                    stats["signals"] += 1
+                if not is_new or key in state["sent"]:
+                    continue
+                now_ms = int(time.time() * 1000)
+                age = signal_age_min(timeframe, signal_ts, now_ms)
+                if age > C.MAX_SIGNAL_AGE_MIN:
+                    log(f"Skip stale {key}: {age:.0f} min after candle close")
+                    stats["stale"] += 1
+                    continue
+                current = candles_all[-1]["c"]
+                entry = candles[event["retest_index"]]["c"]
+                status = entry_status(entry, event["lh_price"], current) if event.get("lh_price") else "ok"
+                if C.SKIP_IF_CHASE and status != "ok":
+                    log(f"Skip {key}: price {current} already {status}")
+                    stats["chased"] += 1
+                    continue
+                state["pending"].setdefault(key, {
+                    "message": message_for(inst_id, timeframe, candles, event, current, now_ms),
+                    "created_at": now_ms,
+                    "close_ts": signal_ts + settings["milliseconds"],
+                })
+                stats["signals"] += 1
             state["processed"][state_key] = candles[-1]["ts"]
         log(f"{timeframe}: scanned {len(instruments)} instruments")
     return stats
@@ -228,7 +277,13 @@ def scan(state: dict) -> dict:
 
 def flush_pending(state: dict) -> int:
     sent_count = 0
+    now_ms = int(time.time() * 1000)
     for key, item in list(state["pending"].items()):
+        # Не досылать из очереди то, что уже устарело (например, после сбоя Telegram)
+        if now_ms - item.get("close_ts", item.get("created_at", 0)) > C.MAX_SIGNAL_AGE_MIN * 60000:
+            log(f"Drop stale queued {key}")
+            del state["pending"][key]
+            continue
         if telegram_send(item["message"]):
             state["sent"][key] = int(time.time() * 1000)
             del state["pending"][key]
@@ -251,6 +306,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.dry_run:
         os.environ["DRY_RUN"] = "1"
+        os.environ["SCAN_ALL"] = "1"
     if os.environ.get("TEST_TELEGRAM") == "1":
         ok = telegram_send("✅ Market Structure Scanner: Telegram connection works.")
         return 0 if ok else 1
@@ -265,6 +321,7 @@ def main() -> int:
     elapsed = (time.monotonic() - started) / 60
     log(f"Summary: instrument/timeframe checks={stats['instruments']}, "
         f"errors={stats['errors']}, new confirmations={stats['signals']}, "
+        f"skipped stale={stats['stale']}, skipped chased={stats['chased']}, "
         f"notifications sent={stats.get('sent', 0)}, pending={len(state['pending'])}, "
         f"elapsed={elapsed:.1f} min")
     return 0

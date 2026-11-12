@@ -33,7 +33,7 @@ class StructureTests(unittest.TestCase):
             candle(11, 8, 9),         # low
             candle(13, 10.2, 12),     # higher high
             candle(12, 10, 11),       # higher low
-            candle(14, 11, 13),       # higher high
+            candle(14, 11.8, 13),     # higher high (low above 11.5 so the next candle is a real HL)
             candle(13, 11.5, 12),     # higher low
             candle(12, 12, 12.5),     # confirms higher low
             candle(12, 10.5, 10.8),   # CHoCH below 11.5
