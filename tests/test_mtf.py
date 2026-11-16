@@ -5,7 +5,7 @@ from unittest import mock
 
 import config as C
 import scanner as SC
-from structure import bearish_state, find_bearish_confirmations
+from structure import bearish_state
 
 M15 = 15 * 60 * 1000
 H = 60 * 60 * 1000
@@ -54,22 +54,19 @@ class StructureStateTests(unittest.TestCase):
         self.assertEqual(st["last_event_lh"], 12)
 
 
-class LateFilterTests(SmallPivots):
-    def test_normal_retest_is_not_late(self):
+class CrashWarningTests(SmallPivots):
+    def test_normal_breakout_has_no_warning(self):
         cs = reversal(M15)
-        e = find_bearish_confirmations(cs, **KW)[-1]
-        self.assertIsNone(SC.late_reason(cs, e))
+        self.assertIsNone(SC.crash_warning(cs, 12))
 
-    def test_far_from_lower_high_is_late(self):
+    def test_crash_candle_warned(self):
         cs = reversal(M15)
-        e = dict(find_bearish_confirmations(cs, **KW)[-1], lh_price=20)
-        self.assertIn("ATR", SC.late_reason(cs, e))
-
-    def test_crash_candle_is_late(self):
-        cs = reversal(M15)
-        e = find_bearish_confirmations(cs, **KW)[-1]
         cs[12] = dict(cs[12], l=4.0)
-        self.assertIn("обвал", SC.late_reason(cs, e))
+        self.assertIn("обвал", SC.crash_warning(cs, 12))
+
+
+def forming(cs, bar_ms):
+    return cs + [dict(cs[-1], ts=cs[-1]["ts"] + bar_ms, closed=False)]
 
 
 class FlowTests(SmallPivots):
@@ -77,59 +74,78 @@ class FlowTests(SmallPivots):
         super().setUp()
         os.environ["DRY_RUN"] = "1"
         self.sent = []
-        self.state = {"processed": {}, "sent": {}, "pending": {}, "watch": {}, "last_entry": {}}
+        self.state = {"processed": {}, "sent": {}, "pending": {}, "watch": {}}
 
     def tearDown(self):
         super().tearDown()
         os.environ.pop("DRY_RUN", None)
         os.environ.pop("SCAN_ALL", None)
 
-    def run_scan(self, c1h, c15, now):
+    def run_scan(self, c1h, c15, now, setups=True):
         def fetch(inst, bar):
             return {"1H": c1h, "15m": c15}.get(bar)
+        if setups:
+            os.environ["SCAN_ALL"] = "1"
+        else:
+            os.environ.pop("SCAN_ALL", None)
         with mock.patch.object(SC, "fetch_instruments", return_value=["PLTR-USDT-SWAP"]), \
              mock.patch.object(SC, "fetch_candles", side_effect=fetch), \
              mock.patch.object(SC, "telegram_send", side_effect=lambda t: self.sent.append(t) or True), \
              mock.patch.object(SC.time, "time", return_value=now / 1000):
-            stats = SC.scan(self.state)
-            SC.flush_pending(self.state)
-        return stats
+            return SC.scan(self.state)
 
-    def test_watch_then_entry(self):
-        c1h = reversal(H)[:9]                            # на 1ч рост только сломался
-        now = c1h[-1]["ts"] + H + 60_000                 # через минуту после закрытия часовой свечи
-        os.environ["SCAN_ALL"] = "1"
+    def breakout(self):
+        """1ч: пробой вниз (свеча 12), ждём ретест к уровню 9; нижний максимум 12."""
+        c1h = forming(reversal(H)[:13], H)
+        now = c1h[-2]["ts"] + H + 60_000
         self.run_scan(c1h, None, now)
-        self.assertIn("PLTR-USDT-SWAP", self.state["watch"])
-        self.assertTrue(any("👀" in t and "PLTR" in t for t in self.sent))
-        os.environ.pop("SCAN_ALL")
-        # на 15м сложилась точка входа: последняя закрытая свеча — ретест (цены ниже часового максимума 14)
-        c15 = reversal(M15, start=now, scale=0.9)
-        c15.append(dict(c15[-1], ts=c15[-1]["ts"] + M15, closed=False))
-        now15 = c15[-2]["ts"] + M15 + 60_000
-        self.run_scan(c1h, c15, now15)
-        entries = [t for t in self.sent if t.startswith("🔻")]
-        self.assertEqual(len(entries), 1, self.sent)
-        self.assertIn("1ч: рост сломался", entries[0])
-        self.assertIn("Вход:", entries[0])
-        # повтор того же сигнала не приходит
-        self.run_scan(c1h, c15, now15 + 60_000)
-        self.assertEqual(len([t for t in self.sent if t.startswith("🔻")]), 1)
+        return c1h, now
 
-    def test_no_entry_for_coin_not_watched(self):
-        c15 = reversal(M15)
-        c15.append(dict(c15[-1], ts=c15[-1]["ts"] + M15, closed=False))
-        self.run_scan(None, c15, c15[-2]["ts"] + M15 + 60_000)
-        self.assertFalse([t for t in self.sent if t.startswith("🔻")])
+    def test_breakout_gives_watch_message(self):
+        self.breakout()
+        self.assertIn("PLTR-USDT-SWAP|1h", self.state["watch"])
+        msg = [t for t in self.sent if t.startswith("👀")]
+        self.assertEqual(len(msg), 1)
+        self.assertIn("PLTR (1ч): уровень 9.0000", msg[0])
 
-    def test_watch_removed_when_trend_resumes(self):
-        self.state["watch"]["PLTR-USDT-SWAP"] = {"stage": "after_choch", "lh": None, "bos": None,
-                                                 "ceiling": 105, "since": 0, "seen": 0}
-        c1h = [dict(candle(10 + i, 9 + i, 9.5 + i), ts=i * H) for i in range(14)]  # ровный рост
-        os.environ["SCAN_ALL"] = "1"
-        self.run_scan(c1h, None, c1h[-1]["ts"] + H + 60_000)
-        self.assertNotIn("PLTR-USDT-SWAP", self.state["watch"])
-        self.assertTrue(any("Отбой" in t for t in self.sent))
+    def test_alarm_when_price_returns_to_level_before_hour_closes(self):
+        c1h, now = self.breakout()
+        later = now + 16 * 60_000
+        c15 = [dict(candle(9.0, 8.6, 8.8), ts=later - 2 * M15), dict(candle(8.95, 8.7, 8.9), ts=later - M15, closed=False)]
+        c15[0]["closed"] = True
+        self.run_scan(c1h, c15, later, setups=False)
+        alarms = [t for t in self.sent if t.startswith("⚡")]
+        self.assertEqual(len(alarms), 1, self.sent)
+        self.assertIn("ретест идёт сейчас", alarms[0])
+        self.assertIn("Свеча 1ч закроется", alarms[0])
+        self.assertIn("Вход: 9.0000", alarms[0])
+        self.run_scan(c1h, c15, later + 60_000, setups=False)  # повторно не шлёт
+        self.assertEqual(len([t for t in self.sent if t.startswith("⚡")]), 1)
+
+    def test_no_alarm_while_price_is_below_level(self):
+        c1h, now = self.breakout()
+        later = now + 16 * 60_000
+        c15 = [dict(candle(8.6, 8.3, 8.5), ts=later - 2 * M15), dict(candle(8.55, 8.3, 8.4), ts=later - M15, closed=False)]
+        self.run_scan(c1h, c15, later, setups=False)
+        self.assertFalse([t for t in self.sent if t.startswith("⚡")])
+
+    def test_confirmation_after_hour_closes(self):
+        self.breakout()
+        c1h = forming(reversal(H), H)
+        self.run_scan(c1h, None, c1h[-2]["ts"] + H + 60_000)
+        ok = [t for t in self.sent if t.startswith("✅")]
+        self.assertEqual(len(ok), 1, self.sent)
+        self.assertIn("ретест подтверждён", ok[0])
+        self.assertNotIn("PLTR-USDT-SWAP|1h", self.state["watch"])
+        self.assertFalse([t for t in self.sent if "Отбой" in t])
+
+    def test_cancel_when_price_closes_above_lower_high(self):
+        self.breakout()
+        cs = reversal(H)[:13] + [dict(candle(13, 9, 12.8), ts=13 * H)]
+        c1h = forming(cs, H)
+        self.run_scan(c1h, None, c1h[-2]["ts"] + H + 60_000)
+        self.assertNotIn("PLTR-USDT-SWAP|1h", self.state["watch"])
+        self.assertTrue(any("Отбой" in t and "выше нижнего максимума" in t for t in self.sent), self.sent)
 
 
 if __name__ == "__main__":

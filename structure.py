@@ -161,6 +161,6 @@ def _run(
                 high_reference = choch_index = interim_low = lh_index = bos_index = bos_level = lh_price = None
 
     state = {"stage": stage, "high_reference": high_reference, "lh_price": lh_price, "bos_level": bos_level,
-             "choch_index": choch_index, "last_event_index": output[-1]["retest_index"] if output else None,
+             "choch_index": choch_index, "lh_index": lh_index, "bos_index": bos_index, "last_event_index": output[-1]["retest_index"] if output else None,
              "last_event_lh": output[-1]["lh_price"] if output else None}
     return output, state
