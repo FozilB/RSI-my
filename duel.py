@@ -75,7 +75,7 @@ def decide(inst_id: str, tf: str, w: dict, current: float, fetch_candles) -> str
         closes = [c["c"] for c in cs if c["closed"]]
         sma = _sma(closes, 50)
         if sma is not None and closes[-1] > sma:
-            return "на 4ч рост (цена выше средней)"
+            return "на 4ч рост"
     return None
 
 
