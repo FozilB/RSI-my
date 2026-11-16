@@ -54,7 +54,25 @@ def _atr(candles: list[dict], end: int, period: int) -> float:
     return sum(ranges) / len(ranges) if ranges else 0.0
 
 
-def find_bearish_confirmations(
+def find_bearish_confirmations(candles: list[dict], **kwargs) -> list[dict]:
+    """Find completed bearish CHoCH -> LH -> BOS -> retest sequences.
+
+    Every input candle must be closed and ordered oldest to newest. No current
+    forming candle may be passed in by the caller.
+    """
+    return _run(candles, **kwargs)[0]
+
+
+def bearish_state(candles: list[dict], **kwargs) -> dict:
+    """Состояние схемы на последней закрытой свече: насколько далеко зашёл разворот.
+
+    stage: "trend" (разворота нет), "after_choch" (рост сломался), "after_lh" (есть нижний максимум),
+    "retest" (пробой вниз, ждём возврат к уровню). Плюс уровни и индекс последнего завершённого сигнала.
+    """
+    return _run(candles, **kwargs)[1]
+
+
+def _run(
     candles: list[dict],
     left: int = 3,
     right: int = 3,
@@ -63,12 +81,7 @@ def find_bearish_confirmations(
     min_tolerance_pct: float = 0.001,
     setup_max_bars: int = 60,
     retest_max_bars: int = 12,
-) -> list[dict]:
-    """Find completed bearish CHoCH -> LH -> BOS -> retest sequences.
-
-    Every input candle must be closed and ordered oldest to newest. No current
-    forming candle may be passed in by the caller.
-    """
+) -> tuple[list[dict], dict]:
     swings = find_swings(candles, left, right)
     by_confirmation = {}
     for swing in swings:
@@ -147,4 +160,7 @@ def find_bearish_confirmations(
                 stage = "trend"
                 high_reference = choch_index = interim_low = lh_index = bos_index = bos_level = lh_price = None
 
-    return output
+    state = {"stage": stage, "high_reference": high_reference, "lh_price": lh_price, "bos_level": bos_level,
+             "choch_index": choch_index, "lh_index": lh_index, "bos_index": bos_index, "last_event_index": output[-1]["retest_index"] if output else None,
+             "last_event_lh": output[-1]["lh_price"] if output else None}
+    return output, state

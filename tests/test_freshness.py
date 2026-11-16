@@ -18,14 +18,13 @@ class FreshnessTests(unittest.TestCase):
 
     def test_higher_timeframes_only_right_after_close(self):
         os.environ.pop("SCAN_ALL", None)
-        self.assertTrue(timeframe_due("30m", 10 * H + 31 * M))
+        self.assertTrue(timeframe_due("15m", 10 * H + 46 * M))
         self.assertTrue(timeframe_due("1h", 10 * H + 1 * M))
+        self.assertFalse(timeframe_due("1h", 10 * H + 16 * M))
         self.assertFalse(timeframe_due("1h", 10 * H + 31 * M))
-        self.assertTrue(timeframe_due("4h", 8 * H + 1 * M))
-        self.assertFalse(timeframe_due("4h", 9 * H + 1 * M))
         os.environ["SCAN_ALL"] = "1"
         try:
-            self.assertTrue(timeframe_due("4h", 9 * H + 1 * M))
+            self.assertTrue(timeframe_due("1h", 10 * H + 31 * M))
         finally:
             os.environ.pop("SCAN_ALL")
 
@@ -39,7 +38,7 @@ class FreshnessTests(unittest.TestCase):
         candles = [{"ts": 0, "o": 1.02, "h": 1.03, "l": 0.99, "c": 1.00, "v": 1, "closed": True}]
         event = {"retest_index": 0, "bos_level": 1.01, "lh_price": 1.04}
         text = message_for("TEST-USDT-SWAP", "1h", candles, event, current=0.99, now_ms=H + 7 * M)
-        self.assertIn("Сейчас: 0.99 (-1.00% от входа) · сигналу 7 мин", text)
+        self.assertIn("сигналу 7 мин · цена сейчас 0.99 (−1.0%)", text)
 
 
 if __name__ == "__main__":
