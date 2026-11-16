@@ -40,7 +40,7 @@ class DecideTests(unittest.TestCase):
 
 class TrackTests(unittest.TestCase):
     def open_trade(self):
-        d = {"trades": [], "signals": [], "skipped": []}
+        d = {"trades": [], "signals": [], "skipped": [], "deposit": 100.0, "balance": 100.0}
         D.on_alarm(d, "X-USDT-SWAP", "4h", W, 100.0, 0, lambda *a: None)
         return d, d["trades"][0]
 
@@ -65,6 +65,22 @@ class TrackTests(unittest.TestCase):
         D.track(d, 2 * M15, lambda *a: cs)
         self.assertEqual(t["why"], "безубыток")
         self.assertAlmostEqual(t["r"], 0.5 * C.TP1_R)
+
+    def test_money_with_deposit_and_fees(self):
+        d, t = self.open_trade()
+        self.assertAlmostEqual(t["risk_usd"], 2.0)                    # 2% от $100
+        self.assertAlmostEqual(t["qty"] * t["risk"], 2.0)
+        D.track(d, M15, lambda *a: [c(0, 102.5, 99.5, 102.3)])        # стоп
+        fees = (t["qty"] * t["entry"] + t["qty"] * t["sl0"]) * C.DUEL_FEE_PCT / 100
+        self.assertAlmostEqual(t["usd"], round(-2.0 - fees, 2), places=2)
+        self.assertAlmostEqual(d["balance"], round(100 - 2.0 - fees, 2), places=2)
+        self.assertEqual(t["balance"], d["balance"])
+
+    def test_next_trade_sized_from_new_balance(self):
+        d, t = self.open_trade()
+        D.track(d, M15, lambda *a: [c(0, 102.5, 99.5, 102.3)])
+        D.on_alarm(d, "Y-USDT-SWAP", "4h", W, 100.0, 2 * M15, lambda *a: None)
+        self.assertAlmostEqual(d["trades"][-1]["risk_usd"], round(d["balance"] * 0.02, 2))
 
     def test_one_trade_per_coin(self):
         d, _ = self.open_trade()
