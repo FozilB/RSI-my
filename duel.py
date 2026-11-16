@@ -4,7 +4,8 @@
   • входит по рынку в момент ⚡ (цена вернулась к уровню ретеста на 1ч/4ч);
   • пропускает: пробой свечой-обвалом, широкий стоп, сетап 1ч при росте на 4ч (цена выше SMA50 4ч);
   • стоп над нижним максимумом, на цели 1 закрывает половину и переносит стоп в безубыток, остаток — на цели 2;
-  • если за DUEL_MAX_HOURS сделка не закрылась — закрывает по рынку.
+  • если за DUEL_MAX_HOURS сделка не закрылась — закрывает по рынку;
+  • депозит DUEL_DEPOSIT, объём сделки — чтобы на стопе потерять DUEL_RISK_PCT % баланса; комиссия DUEL_FEE_PCT.
 Итоги пишутся в state/duel.json; workflow публикует его в ветку duel-data, оттуда табло берёт бот-помощник.
 """
 from __future__ import annotations
@@ -29,6 +30,8 @@ def load() -> dict:
     d.setdefault("trades", [])
     d.setdefault("signals", [])
     d.setdefault("skipped", [])
+    d.setdefault("deposit", C.DUEL_DEPOSIT)
+    d.setdefault("balance", C.DUEL_DEPOSIT)
     return d
 
 
@@ -90,15 +93,30 @@ def on_alarm(d: dict, inst_id: str, tf: str, w: dict, current: float, now_ms: in
         return
     sl = w["lh"] * (1 + C.SL_BUFFER_PCT / 100)
     risk = sl - current
-    d["trades"].append({"inst": inst_id, "tf": tf, "opened": now_ms, "checked": now_ms, "entry": current,
-                        "sl0": sl, "stop": sl, "risk": risk, "tp1": current - risk * C.TP1_R,
-                        "tp2": current - risk * C.TP2_R, "t1": False, "closed": None, "r": None, "why": None})
+    risk_usd = d["balance"] * C.DUEL_RISK_PCT / 100
+    qty = risk_usd / risk
+    d["trades"].append({"inst": inst_id, "tf": tf, "side": "short", "opened": now_ms, "checked": now_ms,
+                        "entry": current, "sl0": sl, "stop": sl, "risk": risk, "tp1": current - risk * C.TP1_R,
+                        "tp2": current - risk * C.TP2_R, "t1": False, "closed": None, "r": None, "why": None,
+                        "qty": qty, "size_usd": round(qty * current, 2), "risk_usd": round(risk_usd, 2)})
 
 
-def _close(t: dict, price: float, now_ms: int, why: str) -> None:
+def _close(d: dict, t: dict, price: float, now_ms: int, why: str) -> None:
     rest = (t["entry"] - price) / t["risk"]
     t["r"] = round(0.5 * C.TP1_R + 0.5 * rest if t["t1"] else rest, 3)
     t["exit"], t["closed"], t["why"] = price, now_ms, why
+    qty = t.get("qty")
+    if qty:
+        if t["t1"]:
+            gross = qty * 0.5 * (t["entry"] - t["tp1"]) + qty * 0.5 * (t["entry"] - price)
+            exit_value = qty * 0.5 * t["tp1"] + qty * 0.5 * price
+        else:
+            gross = qty * (t["entry"] - price)
+            exit_value = qty * price
+        fees = (qty * t["entry"] + exit_value) * C.DUEL_FEE_PCT / 100
+        t["usd"] = round(gross - fees, 2)
+        d["balance"] = round(d["balance"] + gross - fees, 2)
+        t["balance"] = d["balance"]
 
 
 def track(d: dict, now_ms: int, fetch_candles) -> None:
@@ -113,14 +131,14 @@ def track(d: dict, now_ms: int, fetch_candles) -> None:
             if c["ts"] + M15 <= t["checked"]:
                 continue
             if c["h"] >= t["stop"]:
-                _close(t, t["stop"], now_ms, "безубыток" if t["t1"] else "стоп")
+                _close(d, t, t["stop"], now_ms, "безубыток" if t["t1"] else "стоп")
                 break
             if not t["t1"] and c["l"] <= t["tp1"]:
-                t["t1"], t["stop"] = True, t["entry"]
+                t["t1"], t["stop"], t["t1_at"] = True, t["entry"], now_ms
             if t["t1"] and c["l"] <= t["tp2"]:
-                _close(t, t["tp2"], now_ms, "цель 2")
+                _close(d, t, t["tp2"], now_ms, "цель 2")
                 break
         if t.get("closed") is None:
             t["checked"] = now_ms
             if now_ms - t["opened"] > C.DUEL_MAX_HOURS * H:
-                _close(t, cs[-1]["c"], now_ms, f"{C.DUEL_MAX_HOURS} ч — закрыто по рынку")
+                _close(d, t, cs[-1]["c"], now_ms, f"{C.DUEL_MAX_HOURS} ч — закрыто по рынку")
