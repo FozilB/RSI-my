@@ -30,6 +30,7 @@ def load() -> dict:
     d.setdefault("trades", [])
     d.setdefault("signals", [])
     d.setdefault("skipped", [])
+    d.setdefault("outbox", [])
     d.setdefault("deposit", C.DUEL_DEPOSIT)
     d.setdefault("balance", C.DUEL_DEPOSIT)
     return d
@@ -44,7 +45,8 @@ def save(d: dict, now_ms: int) -> bool:
     path = Path(DUEL_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    public = dict(d, trades=[{k: v for k, v in t.items() if k != "checked"} for t in d["trades"]])
+    public = {k: v for k, v in d.items() if k != "outbox"}
+    public["trades"] = [{k: v for k, v in t.items() if k != "checked"} for t in d["trades"]]
     text = json.dumps(public, ensure_ascii=False, sort_keys=True)
     pub = Path(PUBLIC_FILE)
     try:
@@ -54,6 +56,28 @@ def save(d: dict, now_ms: int) -> bool:
         pass
     pub.write_text(text, encoding="utf-8")
     return True
+
+
+def px(x: float) -> str:
+    """Цена: 5 значащих цифр."""
+    if x <= 0:
+        return f"{x:g}"
+    import math
+    return f"{x:.{max(0, 4 - int(math.floor(math.log10(x))))}f}"
+
+
+def coin(inst_id: str) -> str:
+    return inst_id.removesuffix("-USDT-SWAP")
+
+
+def tf_label(tf: str) -> str:
+    return {"1h": "1ч", "4h": "4ч", "15m": "15м"}.get(tf, tf)
+
+
+def say(d: dict, text: str, now_ms: int) -> None:
+    """Сообщение в канал конкурента (отправляет scanner, если задан DUEL_CHAT)."""
+    if C.DUEL_CHAT:
+        d["outbox"].append({"text": text, "ts": now_ms})
 
 
 def add_signal(d: dict, inst_id: str, tf: str, kind: str, ts: int) -> None:
@@ -86,10 +110,12 @@ def on_alarm(d: dict, inst_id: str, tf: str, w: dict, current: float, now_ms: in
     add_signal(d, inst_id, tf, "alarm", now_ms)
     if any(t["inst"] == inst_id and t.get("closed") is None for t in d["trades"]):
         d["skipped"].append({"inst": inst_id, "tf": tf, "ts": now_ms, "why": "уже в сделке по этой монете"})
+        say(d, f"⏭ Пропускаю {coin(inst_id)} ({tf_label(tf)}) — уже в сделке по этой монете", now_ms)
         return
     why = decide(inst_id, tf, w, current, fetch_candles)
     if why:
         d["skipped"].append({"inst": inst_id, "tf": tf, "ts": now_ms, "why": why})
+        say(d, f"⏭ Пропускаю {coin(inst_id)} ({tf_label(tf)}) — {why}", now_ms)
         return
     sl = w["lh"] * (1 + C.SL_BUFFER_PCT / 100)
     risk = sl - current
@@ -99,6 +125,10 @@ def on_alarm(d: dict, inst_id: str, tf: str, w: dict, current: float, now_ms: in
                         "entry": current, "sl0": sl, "stop": sl, "risk": risk, "tp1": current - risk * C.TP1_R,
                         "tp2": current - risk * C.TP2_R, "t1": False, "closed": None, "r": None, "why": None,
                         "qty": qty, "size_usd": round(qty * current, 2), "risk_usd": round(risk_usd, 2)})
+    t = d["trades"][-1]
+    say(d, f"🔻 Вошёл SHORT {coin(inst_id)} ({tf_label(tf)}) по {px(current)}\n"
+           f"Стоп {px(sl)} · цель 1 {px(t['tp1'])} · цель 2 {px(t['tp2'])}\n"
+           f"Объём ${t['size_usd']:.0f} · риск ${t['risk_usd']:.2f} · баланс ${d['balance']:.2f}", now_ms)
 
 
 def _close(d: dict, t: dict, price: float, now_ms: int, why: str) -> None:
@@ -117,6 +147,9 @@ def _close(d: dict, t: dict, price: float, now_ms: int, why: str) -> None:
         t["usd"] = round(gross - fees, 2)
         d["balance"] = round(d["balance"] + gross - fees, 2)
         t["balance"] = d["balance"]
+    money = f" · {'+' if t.get('usd', 0) >= 0 else '−'}${abs(t.get('usd', 0)):.2f}" if t.get("usd") is not None else ""
+    bal = f" · баланс ${d['balance']:.2f}" if "balance" in d else ""
+    say(d, f"{'✅' if t['r'] > 0 else '❌'} Закрыл {coin(t['inst'])} по {px(price)} ({why}) · {t['r']:+.2f}R{money}{bal}", now_ms)
 
 
 def track(d: dict, now_ms: int, fetch_candles) -> None:
@@ -135,6 +168,7 @@ def track(d: dict, now_ms: int, fetch_candles) -> None:
                 break
             if not t["t1"] and c["l"] <= t["tp1"]:
                 t["t1"], t["stop"], t["t1_at"] = True, t["entry"], now_ms
+                say(d, f"🎯 {coin(t['inst'])} цель 1 {px(t['tp1'])} — закрыл половину, стоп в безубыток {px(t['entry'])}", now_ms)
             if t["t1"] and c["l"] <= t["tp2"]:
                 _close(d, t, t["tp2"], now_ms, "цель 2")
                 break

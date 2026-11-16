@@ -267,12 +267,12 @@ def alarm_message(key: str, w: dict, current: float, now_ms: int) -> str:
     return "\n".join(lines)
 
 
-def telegram_send(text: str) -> bool:
+def telegram_send(text: str, chat: str | None = None) -> bool:
     if os.environ.get("DRY_RUN") == "1":
         log("[DRY RUN] " + text.replace("\n", " | "))
         return True
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    chat_id = chat or os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         log("Telegram secrets are not configured; notification stays queued")
         return False
@@ -427,6 +427,23 @@ def scan(state: dict) -> dict:
     return stats
 
 
+def flush_duel(d: dict | None) -> None:
+    """Сообщения конкурента — в его канал. Не ушло — повтор в следующий запуск, старше часа — выбрасывается."""
+    if not d or not C.DUEL_CHAT:
+        return
+    now_ms = int(time.time() * 1000)
+    keep = []
+    for m in d.get("outbox", []):
+        if now_ms - m["ts"] > H_MS:
+            continue
+        if not telegram_send(m["text"], C.DUEL_CHAT):
+            keep.append(m)
+    d["outbox"] = keep
+
+
+H_MS = 60 * 60 * 1000
+
+
 def flush_pending(state: dict) -> int:
     sent_count = 0
     now_ms = int(time.time() * 1000)
@@ -470,6 +487,7 @@ def main() -> int:
         stats = scan(state)
         stats["sent"] += flush_pending(state)
         prune_state(state)
+        flush_duel(DUEL_STATE)
     finally:
         save_state(state)
         if DUEL_STATE is not None and D.save(DUEL_STATE, int(time.time() * 1000)):

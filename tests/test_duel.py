@@ -40,7 +40,7 @@ class DecideTests(unittest.TestCase):
 
 class TrackTests(unittest.TestCase):
     def open_trade(self):
-        d = {"trades": [], "signals": [], "skipped": [], "deposit": 100.0, "balance": 100.0}
+        d = {"trades": [], "signals": [], "skipped": [], "outbox": [], "deposit": 100.0, "balance": 100.0}
         D.on_alarm(d, "X-USDT-SWAP", "4h", W, 100.0, 0, lambda *a: None)
         return d, d["trades"][0]
 
@@ -81,6 +81,24 @@ class TrackTests(unittest.TestCase):
         D.track(d, M15, lambda *a: [c(0, 102.5, 99.5, 102.3)])
         D.on_alarm(d, "Y-USDT-SWAP", "4h", W, 100.0, 2 * M15, lambda *a: None)
         self.assertAlmostEqual(d["trades"][-1]["risk_usd"], round(d["balance"] * 0.02, 2))
+
+    def test_channel_messages(self):
+        with mock.patch.object(C, "DUEL_CHAT", "@test"):
+            d, t = self.open_trade()
+            cs = [c(0, 100.2, t["tp1"] - 0.01, t["tp1"]), c(M15, 100.5, t["tp1"], 100.3)]
+            D.track(d, 2 * M15, lambda *a: cs)
+            D.on_alarm(d, "Z-USDT-SWAP", "1h", dict(W, warn="⚠️"), 100.0, 3 * M15, lambda *a: None)
+        texts = [m["text"] for m in d["outbox"]]
+        self.assertTrue(texts[0].startswith("🔻 Вошёл SHORT X (4ч) по 100.00"))
+        self.assertIn("🎯 X цель 1", texts[1])
+        self.assertIn("✅ Закрыл X", texts[2])
+        self.assertIn("баланс $", texts[2])
+        self.assertIn("⏭ Пропускаю Z (1ч) — пробой свечой-обвалом", texts[3])
+
+    def test_silent_without_channel(self):
+        with mock.patch.object(C, "DUEL_CHAT", ""):
+            d, _ = self.open_trade()
+        self.assertEqual(d["outbox"], [])
 
     def test_one_trade_per_coin(self):
         d, _ = self.open_trade()
