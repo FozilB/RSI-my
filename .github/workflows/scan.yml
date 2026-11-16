@@ -22,8 +22,9 @@ env:
   OFFSET_SEC: "60"
 
 # actions: write нужен, чтобы запуск мог поставить следующий запуск (цепочка)
+# contents: write — только чтобы публиковать табло бота-конкурента в отдельную ветку duel-data (main не меняется)
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 concurrency:
@@ -63,6 +64,27 @@ jobs:
         with:
           path: state
           key: market-structure-state-${{ github.run_id }}
+
+      - name: Опубликовать результаты бота-конкурента
+        # Только виртуальные сделки бота и список сигналов. Ветка duel-data, main не трогается.
+        if: ${{ always() && !inputs.test_telegram && !inputs.dry_run && hashFiles('state/duel_public.json') != '' }}
+        continue-on-error: true
+        run: |
+          git config user.name "duel-bot"
+          git config user.email "duel-bot@users.noreply.github.com"
+          if git fetch -q --depth 1 origin duel-data 2>/dev/null; then
+            git worktree add -q /tmp/duel FETCH_HEAD
+          else
+            git worktree add -q --detach /tmp/duel
+            git -C /tmp/duel checkout -q --orphan duel-data
+            git -C /tmp/duel rm -rq . 2>/dev/null || true
+          fi
+          cp state/duel_public.json /tmp/duel/duel.json
+          cd /tmp/duel
+          git add duel.json
+          if git diff --cached --quiet; then echo "Табло без изменений"; exit 0; fi
+          git commit -qm "Табло бота-конкурента"
+          git push -q origin HEAD:refs/heads/duel-data && echo "Табло опубликовано"
 
       - name: Следующий запуск (цепочка)
         # Следующий запуск ставится сразу и ждёт в очереди (concurrency), пока этот не закончится.
