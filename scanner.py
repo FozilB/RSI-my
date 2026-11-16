@@ -11,6 +11,7 @@ from pathlib import Path
 import requests
 
 import config as C
+import duel as D
 from structure import _atr, bearish_state, find_bearish_confirmations
 
 OKX = "https://www.okx.com"
@@ -308,6 +309,9 @@ def queue(state: dict, key: str, text: str, close_ts: int) -> None:
     state["pending"].setdefault(key, {"message": text, "created_at": now_ms, "close_ts": close_ts})
 
 
+DUEL_STATE: dict | None = None  # состояние бота-конкурента на время запуска (см. main)
+
+
 def check_alarms(state: dict, stats: dict) -> None:
     """⚡ Каждые 15 минут: у сетапов, ждущих ретест, смотрим 15м — дошла ли цена до уровня."""
     for key, w in list(state["watch"].items()):
@@ -332,6 +336,8 @@ def check_alarms(state: dict, stats: dict) -> None:
         w["alarmed"] = True
         queue(state, f"alarm|{key}|{w['since']}", alarm_message(key, w, current, now_ms), now_ms)
         stats["alarms"] += 1
+        if C.DUEL and DUEL_STATE is not None:
+            D.on_alarm(DUEL_STATE, inst_id, key.split("|")[1], w, current, now_ms, fetch_candles)
     stats["sent"] += flush_pending(state)
 
 
@@ -372,6 +378,8 @@ def scan_setups(state: dict, stats: dict, timeframe: str, instruments: list[str]
             queue(state, key, message_for(inst_id, timeframe, candles, event, current, now_ms),
                   signal_ts + C.TIMEFRAMES[timeframe]["milliseconds"])
             stats["signals"] += 1
+            if C.DUEL and DUEL_STATE is not None:
+                D.add_signal(DUEL_STATE, inst_id, timeframe, "confirm", now_ms)
         state["processed"][state_key] = candles[-1]["ts"]
 
         st = bearish_state(candles, **structure_kwargs())
@@ -405,6 +413,8 @@ def scan(state: dict) -> dict:
              "chased": 0, "watch_added": 0, "watch_removed": 0, "sent": 0}
     # Сначала будильник ⚡ (быстро и срочно), потом полный проход 1ч/4ч, если их свеча только что закрылась.
     check_alarms(state, stats)
+    if C.DUEL and DUEL_STATE is not None:
+        D.track(DUEL_STATE, int(time.time() * 1000), fetch_candles)
     due = [tf for tf in C.SETUP_TIMEFRAMES if timeframe_due(tf, int(time.time() * 1000))]
     for tf in C.SETUP_TIMEFRAMES:
         if tf not in due:
@@ -452,7 +462,9 @@ def main() -> int:
     if os.environ.get("TEST_TELEGRAM") == "1":
         ok = telegram_send("✅ Сканер на связи. 👀 пробой на 1ч/4ч → ⚡ цена у уровня (15м) → ✅ ретест подтверждён.")
         return 0 if ok else 1
+    global DUEL_STATE
     state = load_state()
+    DUEL_STATE = D.load() if C.DUEL else None
     started = time.monotonic()
     try:
         stats = scan(state)
@@ -460,6 +472,8 @@ def main() -> int:
         prune_state(state)
     finally:
         save_state(state)
+        if DUEL_STATE is not None and D.save(DUEL_STATE, int(time.time() * 1000)):
+            log("Duel: results changed, will publish")
     elapsed = (time.monotonic() - started) / 60
     log(f"Summary: setup checks={stats['instruments']}, 15m alarm checks={stats['alarm_checks']}, "
         f"waiting for retest={len(state['watch'])} (+{stats['watch_added']} / -{stats['watch_removed']}), "
