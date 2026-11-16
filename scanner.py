@@ -11,7 +11,7 @@ from pathlib import Path
 import requests
 
 import config as C
-from structure import find_bearish_confirmations
+from structure import _atr, bearish_state, find_bearish_confirmations
 
 OKX = "https://www.okx.com"
 TASHKENT = dt.timezone(dt.timedelta(hours=5))
@@ -72,6 +72,8 @@ def load_state() -> dict:
     state.setdefault("processed", {})
     state.setdefault("sent", {})
     state.setdefault("pending", {})
+    state.setdefault("watch", {})
+    state.setdefault("last_entry", {})
     return state
 
 
@@ -114,31 +116,31 @@ def trade_levels(entry: float, stop_above: float) -> dict | None:
             "tp1": entry - risk * C.TP1_R, "tp2": entry - risk * C.TP2_R}
 
 
-def trade_plan_text(entry: float, stop_above: float) -> str:
-    """Блок «План сделки». Только подсказка: бот сам ордера не ставит."""
+def pct_from(x: float, base: float) -> str:
+    return f"{(x / base - 1) * 100:+.1f}%".replace("-", "−")
+
+
+def plan_lines(entry: float, stop_above: float) -> list[str]:
+    """План шорта простыми словами. Только подсказка: бот сам ордера не ставит."""
     t = trade_levels(entry, stop_above)
     if t is None:
-        return ""
-
-    def pct(x: float) -> str:
-        return f"{(x / t['entry'] - 1) * 100:+.2f}%"
-
+        return []
     size = C.RISK_USDT / (t["risk_pct"] / 100)
     lines = [
-        "",
-        "📉 План сделки (шорт, фьючерс)",
-        f"Вход: {plan_price(t['entry'])} (закрытие свечи ретеста)",
-        f"Стоп-лосс: {plan_price(t['sl'])} ({pct(t['sl'])}) — выше LH",
-        f"Тейк 1: {plan_price(t['tp1'])} ({pct(t['tp1'])}) — закрыть половину, стоп перенести в точку входа",
-        f"Тейк 2: {plan_price(t['tp2'])} ({pct(t['tp2'])}) — закрыть остаток",
-        f"Объём позиции: ~{size:,.0f} USDT (при стопе потеря ≈ {C.RISK_USDT:g} USDT)",
-        f"Не входить, если цена уже ниже {plan_price(t['entry'] - t['risk'] * C.MAX_CHASE_R)} "
-        f"или выше {plan_price(t['sl'])}",
+        f"Вход: {plan_price(t['entry'])}",
+        f"Стоп: {plan_price(t['sl'])} ({pct_from(t['sl'], entry)}) — над нижним максимумом",
+        f"Цель 1: {plan_price(t['tp1'])} ({pct_from(t['tp1'], entry)}) — закрыть половину, стоп в безубыток",
+        f"Цель 2: {plan_price(t['tp2'])} ({pct_from(t['tp2'], entry)}) — закрыть остаток",
+        f"Объём: ~{size:,.0f} USDT (если сработает стоп — минус {C.RISK_USDT:g} USDT)",
     ]
     if t["risk_pct"] > C.MAX_RISK_PCT:
-        lines.append(f"⚠️ Широкий стоп ({t['risk_pct']:.1f}%): лучше пропустить.")
-    lines.append("Это подсказка, не гарантия. Без стоп-лосса не входить.")
-    return "\n".join(lines) + "\n"
+        lines.append(f"⚠️ Стоп широкий ({t['risk_pct']:.1f}%) — лучше пропустить.")
+    return lines
+
+
+def trade_plan_text(entry: float, stop_above: float) -> str:
+    lines = plan_lines(entry, stop_above)
+    return ("\n" + "\n".join(lines) + "\n") if lines else ""
 
 
 def entry_status(entry: float, stop_above: float, current: float) -> str:
@@ -153,43 +155,97 @@ def entry_status(entry: float, stop_above: float, current: float) -> str:
     return "ok"
 
 
+def late_reason(candles: list[dict], event: dict) -> str | None:
+    """Фильтр «поздно»: цена уже далеко от нижнего максимума или пробой был огромной свечой-обвалом."""
+    # «Обычная свеча» — по свечам ДО пробоя, иначе свеча-обвал сама раздувает ATR и прячет опоздание.
+    atr = _atr(candles, max(1, event["bos_index"] - 1), C.ATR_PERIOD)
+    if atr <= 0:
+        return None
+    entry = candles[event["retest_index"]]["c"]
+    passed = (event["lh_price"] - entry) / atr
+    if passed > C.LATE_MAX_ATR:
+        return f"от нижнего максимума уже пройдено {passed:.1f} ATR"
+    b = candles[event["bos_index"]]
+    if (b["h"] - b["l"]) > C.BIG_BOS_CANDLE_ATR * atr:
+        return f"пробой свечой-обвалом ({(b['h'] - b['l']) / atr:.1f} ATR)"
+    return None
+
+
 def signal_age_min(timeframe: str, candle_ts: int, now_ms: int) -> float:
     close_ts = candle_ts + C.TIMEFRAMES[timeframe]["milliseconds"]
     return (now_ms - close_ts) / 60000
 
 
 def timeframe_due(timeframe: str, now_ms: int) -> bool:
-    """30m сканируется всегда; 1h/4h - только в первые DUE_WINDOW_MIN минут после закрытия их свечи."""
-    if timeframe == "30m" or os.environ.get("SCAN_ALL") == "1":
+    """15м проверяется всегда; 1ч - только в первые DUE_WINDOW_MIN минут после закрытия часовой свечи."""
+    if timeframe == C.ENTRY_TF or os.environ.get("SCAN_ALL") == "1":
         return True
     period = C.TIMEFRAMES[timeframe]["milliseconds"]
     return now_ms % period < C.DUE_WINDOW_MIN * 60000
 
 
+def chart_link(inst_id: str, timeframe: str) -> str:
+    base = inst_id.removesuffix("-USDT-SWAP")
+    tf = {"15m": "15", "30m": "30", "1h": "60", "4h": "240"}[timeframe]
+    return f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={tf}"
+
+
+STAGE_TEXT = {
+    "after_choch": "рост сломался",
+    "after_lh": "рост сломался, нижний максимум {lh}",
+    "retest": "нижний максимум {lh}, пробой вниз {bos}",
+    "done": "разворот подтверждён, нижний максимум {lh}",
+}
+
+
+def stage_text(watch: dict) -> str:
+    return STAGE_TEXT[watch["stage"]].format(lh=plan_price(watch["lh"]) if watch.get("lh") else "—",
+                                             bos=plan_price(watch["bos"]) if watch.get("bos") else "—")
+
+
 def message_for(inst_id: str, timeframe: str, candles: list[dict], event: dict,
-                current: float | None = None, now_ms: int | None = None) -> str:
+                current: float | None = None, now_ms: int | None = None, watch: dict | None = None) -> str:
     index = event["retest_index"]
     candle = candles[index]
     ts = candle["ts"]
     base = inst_id.removesuffix("-USDT-SWAP")
-    chart_tf = {"30m": "30", "1h": "60", "4h": "240"}[timeframe]
-    chart = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={chart_tf}"
-    plan = trade_plan_text(candle["c"], event["lh_price"]) if C.TRADE_PLAN and event.get("lh_price") else ""
-    now_line = ""
+    label = C.TIMEFRAMES[timeframe]["label"]
+    entry = candle["c"]
+    lines = [f"🔻 Шорт {base} — точка входа ({label})"]
+    if watch:
+        lines.append(f"1ч: {stage_text(watch)}")
+    lines.append(f"{label}: цена вернулась к уровню {plan_price(event['bos_level'])} и пошла вниз")
+    if C.TRADE_PLAN and event.get("lh_price"):
+        lines += [""] + plan_lines(entry, event["lh_price"])
+    lines.append("")
+    time_line = f"⏱ Свеча закрылась {format_time(ts + C.TIMEFRAMES[timeframe]['milliseconds'])}"
     if current is not None:
-        age = f" · сигналу {signal_age_min(timeframe, ts, now_ms):.0f} мин" if now_ms is not None else ""
-        now_line = f"Сейчас: {format_price(current)} ({(current / candle['c'] - 1) * 100:+.2f}% от входа){age}\n"
-    return (
-        f"🔻 Market Structure Scanner · {base}/USDT\n\n"
-        f"Таймфрейм: {timeframe}\n"
-        f"Подтверждение: CHoCH → LH → BOS → ретест\n"
-        f"Уровень BOS: {format_price(event['bos_level'])}\n"
-        f"Ретест закрытой свечи: {format_time(ts + C.TIMEFRAMES[timeframe]["milliseconds"])} (Ташкент)\n"
-        f"Закрытие: {format_price(candle['c'])}\n"
-        f"{now_line}"
-        f"{plan}\n"
-        f"График: {chart}"
-    )
+        if now_ms is not None:
+            time_line += f" · сигналу {signal_age_min(timeframe, ts, now_ms):.0f} мин"
+        time_line += f" · цена сейчас {format_price(current)} ({pct_from(current, entry)})"
+    lines.append(time_line)
+    t = trade_levels(entry, event["lh_price"]) if event.get("lh_price") else None
+    if t:
+        lines.append(f"⛔ Не входить, если цена уже ниже {plan_price(t['entry'] - t['risk'] * C.MAX_CHASE_R)} "
+                     f"или выше {plan_price(t['sl'])}")
+    lines.append(f"График: {chart_link(inst_id, timeframe)}")
+    return "\n".join(lines)
+
+
+def watch_summary(added: list[tuple[str, dict]], removed: list[tuple[str, str]]) -> str | None:
+    if not added and not removed:
+        return None
+    lines = []
+    if added:
+        lines.append("👀 Наблюдение (1ч) — здесь может появиться шорт:")
+        for inst, w in added:
+            lines.append(f"• {inst.removesuffix('-USDT-SWAP')} — {stage_text(w)}")
+        lines.append("Это ещё не вход. Точку входа пришлю отдельно, когда она сложится на 15м.")
+    if removed:
+        if lines:
+            lines.append("")
+        lines.append("❌ Отбой: " + ", ".join(f"{i.removesuffix('-USDT-SWAP')} ({why})" for i, why in removed))
+    return "\n".join(lines)
 
 
 def telegram_send(text: str) -> bool:
@@ -215,63 +271,134 @@ def telegram_send(text: str) -> bool:
     return False
 
 
-def scan(state: dict) -> dict:
-    stats = {"instruments": 0, "candles": 0, "signals": 0, "errors": 0, "stale": 0, "chased": 0}
+H_MS = 60 * 60 * 1000
+MAX_WATCH_LIST = 15
+
+
+def structure_kwargs() -> dict:
+    return dict(left=C.PIVOT_LEFT, right=C.PIVOT_RIGHT, atr_period=C.ATR_PERIOD,
+                atr_tolerance=C.RETEST_ATR_TOLERANCE, min_tolerance_pct=C.MIN_RETEST_TOLERANCE_PCT,
+                setup_max_bars=C.SETUP_MAX_BARS, retest_max_bars=C.RETEST_MAX_BARS)
+
+
+def closed_candles(inst_id: str, timeframe: str) -> tuple[list[dict], list[dict]] | None:
+    candles_all = fetch_candles(inst_id, C.TIMEFRAMES[timeframe]["okx"])
+    if not candles_all:
+        return None
+    candles = [c for c in candles_all if c["closed"]]
+    return (candles_all, candles) if candles else None
+
+
+def scan_entries(state: dict, stats: dict) -> None:
+    """15м: ищем точку входа только у монет из наблюдения."""
+    tf = C.ENTRY_TF
+    for inst_id, watch in list(state["watch"].items()):
+        got = closed_candles(inst_id, tf)
+        if got is None:
+            stats["errors"] += 1
+            continue
+        candles_all, candles = got
+        stats["entry_checks"] += 1
+        state_key = f"{inst_id}|{tf}"
+        previous_ts = state["processed"].get(state_key)
+        for event in find_bearish_confirmations(candles, **structure_kwargs()):
+            signal_ts = candles[event["retest_index"]]["ts"]
+            is_new = signal_ts > previous_ts if previous_ts is not None else event["retest_index"] == len(candles) - 1
+            key = signal_key(inst_id, tf, signal_ts)
+            if not is_new or key in state["sent"]:
+                continue
+            now_ms = int(time.time() * 1000)
+            age = signal_age_min(tf, signal_ts, now_ms)
+            if age > C.MAX_SIGNAL_AGE_MIN:
+                log(f"Skip stale {key}: {age:.0f} min after candle close")
+                stats["stale"] += 1
+                continue
+            ceiling = watch.get("ceiling")
+            if ceiling and event["lh_price"] > ceiling * (1 + C.SL_BUFFER_PCT / 100):
+                log(f"Skip {key}: 15m lower high is above the 1h level")
+                continue
+            last = state["last_entry"].get(inst_id)
+            if last and now_ms - last < C.ENTRY_COOLDOWN_MIN * 60000:
+                log(f"Skip {key}: entry signal for this coin was sent recently")
+                continue
+            late = late_reason(candles, event)
+            if late:
+                log(f"Skip late {key}: {late}")
+                stats["late"] += 1
+                continue
+            current = candles_all[-1]["c"]
+            entry = candles[event["retest_index"]]["c"]
+            status = entry_status(entry, event["lh_price"], current)
+            if C.SKIP_IF_CHASE and status != "ok":
+                log(f"Skip {key}: price {current} already {status}")
+                stats["chased"] += 1
+                continue
+            state["pending"].setdefault(key, {
+                "message": message_for(inst_id, tf, candles, event, current, now_ms, watch),
+                "created_at": now_ms,
+                "close_ts": signal_ts + C.TIMEFRAMES[tf]["milliseconds"],
+            })
+            state["last_entry"][inst_id] = now_ms
+            stats["signals"] += 1
+        state["processed"][state_key] = candles[-1]["ts"]
+    log(f"{tf}: checked {len(state['watch'])} watched instruments")
+
+
+def scan_watch(state: dict, stats: dict) -> None:
+    """1ч: раз в час по всем монетам — где начался разворот вниз. Новые попадают в наблюдение."""
+    tf = C.WATCH_TF
     instruments = fetch_instruments()
     log(f"Found {len(instruments)} USDT perpetual instruments on OKX")
-    for timeframe, settings in C.TIMEFRAMES.items():
-        if not timeframe_due(timeframe, int(time.time() * 1000)):
-            log(f"{timeframe}: skipped (its candle did not just close)")
+    now_ms = int(time.time() * 1000)
+    added, removed = [], []
+    for inst_id in instruments:
+        got = closed_candles(inst_id, tf)
+        if got is None:
+            stats["errors"] += 1
             continue
-        for inst_id in instruments:
-            state_key = f"{inst_id}|{timeframe}"
-            candles_all = fetch_candles(inst_id, settings["okx"])
-            if candles_all is None:
-                stats["errors"] += 1
-                continue
-            candles = [c for c in candles_all if c["closed"]]
-            if not candles:
-                stats["errors"] += 1
-                continue
-            stats["instruments"] += 1
-            previous_ts = state["processed"].get(state_key)
-            events = find_bearish_confirmations(
-                candles,
-                left=C.PIVOT_LEFT,
-                right=C.PIVOT_RIGHT,
-                atr_period=C.ATR_PERIOD,
-                atr_tolerance=C.RETEST_ATR_TOLERANCE,
-                min_tolerance_pct=C.MIN_RETEST_TOLERANCE_PCT,
-                setup_max_bars=C.SETUP_MAX_BARS,
-                retest_max_bars=C.RETEST_MAX_BARS,
-            )
-            for event in events:
-                signal_ts = candles[event["retest_index"]]["ts"]
-                is_new = signal_ts > previous_ts if previous_ts is not None else event["retest_index"] == len(candles) - 1
-                key = signal_key(inst_id, timeframe, signal_ts)
-                if not is_new or key in state["sent"]:
-                    continue
-                now_ms = int(time.time() * 1000)
-                age = signal_age_min(timeframe, signal_ts, now_ms)
-                if age > C.MAX_SIGNAL_AGE_MIN:
-                    log(f"Skip stale {key}: {age:.0f} min after candle close")
-                    stats["stale"] += 1
-                    continue
-                current = candles_all[-1]["c"]
-                entry = candles[event["retest_index"]]["c"]
-                status = entry_status(entry, event["lh_price"], current) if event.get("lh_price") else "ok"
-                if C.SKIP_IF_CHASE and status != "ok":
-                    log(f"Skip {key}: price {current} already {status}")
-                    stats["chased"] += 1
-                    continue
-                state["pending"].setdefault(key, {
-                    "message": message_for(inst_id, timeframe, candles, event, current, now_ms),
-                    "created_at": now_ms,
-                    "close_ts": signal_ts + settings["milliseconds"],
-                })
-                stats["signals"] += 1
-            state["processed"][state_key] = candles[-1]["ts"]
-        log(f"{timeframe}: scanned {len(instruments)} instruments")
+        _, candles = got
+        stats["instruments"] += 1
+        st = bearish_state(candles, **structure_kwargs())
+        old = state["watch"].get(inst_id)
+        stage, lh = st["stage"], st["lh_price"]
+        ceiling = st["lh_price"] or st["high_reference"]
+        active = stage in C.WATCH_STAGES
+        last_event = st["last_event_index"]
+        if not active and last_event is not None and len(candles) - 1 - last_event < C.WATCH_KEEP_AFTER_SIGNAL_H:
+            stage, lh, ceiling, active = "done", st["last_event_lh"], st["last_event_lh"], True
+        if active:
+            state["watch"][inst_id] = {"stage": stage, "lh": lh, "bos": st["bos_level"], "ceiling": ceiling,
+                                       "since": old["since"] if old else now_ms, "seen": now_ms}
+            if old is None:
+                added.append((inst_id, state["watch"][inst_id]))
+        elif old is not None:
+            del state["watch"][inst_id]
+            up = old.get("ceiling") and candles[-1]["c"] > old["ceiling"]
+            removed.append((inst_id, "цена выше максимума" if up else "разворот не подтвердился"))
+    for inst_id, w in list(state["watch"].items()):
+        if now_ms - w["seen"] > 2 * H_MS or now_ms - w["since"] > C.WATCH_MAX_HOURS * H_MS:
+            del state["watch"][inst_id]
+            removed.append((inst_id, "устарело"))
+    stats["watch_added"], stats["watch_removed"] = len(added), len(removed)
+    extra = len(added) - MAX_WATCH_LIST
+    text = watch_summary(added[:MAX_WATCH_LIST], removed)
+    if text and extra > 0:
+        text = text.replace("\nЭто ещё не вход", f"\n…и ещё {extra}\nЭто ещё не вход", 1)
+    if text:
+        state["pending"][f"watch|{now_ms}"] = {"message": text, "created_at": now_ms, "close_ts": now_ms}
+    log(f"{tf}: scanned {len(instruments)} instruments, watching {len(state['watch'])}")
+
+
+def scan(state: dict) -> dict:
+    stats = {"instruments": 0, "entry_checks": 0, "signals": 0, "errors": 0, "stale": 0, "chased": 0,
+             "late": 0, "watch_added": 0, "watch_removed": 0, "sent": 0}
+    # Сначала вход (быстро и срочно) — и сразу отправить, не дожидаясь проверки всех монет на 1ч.
+    scan_entries(state, stats)
+    stats["sent"] += flush_pending(state)
+    if timeframe_due(C.WATCH_TF, int(time.time() * 1000)):
+        scan_watch(state, stats)
+    else:
+        log(f"{C.WATCH_TF}: skipped (its candle did not just close)")
     return stats
 
 
@@ -308,22 +435,22 @@ def main() -> int:
         os.environ["DRY_RUN"] = "1"
         os.environ["SCAN_ALL"] = "1"
     if os.environ.get("TEST_TELEGRAM") == "1":
-        ok = telegram_send("✅ Market Structure Scanner: Telegram connection works.")
+        ok = telegram_send("✅ Сканер на связи. Схема: 👀 предупреждение на 1ч → 🔻 точка входа на 15м.")
         return 0 if ok else 1
     state = load_state()
     started = time.monotonic()
     try:
         stats = scan(state)
-        stats["sent"] = flush_pending(state)
+        stats["sent"] += flush_pending(state)
         prune_state(state)
     finally:
         save_state(state)
     elapsed = (time.monotonic() - started) / 60
-    log(f"Summary: instrument/timeframe checks={stats['instruments']}, "
-        f"errors={stats['errors']}, new confirmations={stats['signals']}, "
-        f"skipped stale={stats['stale']}, skipped chased={stats['chased']}, "
-        f"notifications sent={stats.get('sent', 0)}, pending={len(state['pending'])}, "
-        f"elapsed={elapsed:.1f} min")
+    log(f"Summary: 1h checks={stats['instruments']}, 15m checks={stats['entry_checks']}, "
+        f"watching={len(state['watch'])} (+{stats['watch_added']} / -{stats['watch_removed']}), "
+        f"errors={stats['errors']}, entry signals={stats['signals']}, skipped stale={stats['stale']}, "
+        f"skipped late={stats['late']}, skipped chased={stats['chased']}, "
+        f"notifications sent={stats['sent']}, pending={len(state['pending'])}, elapsed={elapsed:.1f} min")
     return 0
 
 
