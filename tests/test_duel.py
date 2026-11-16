@@ -96,7 +96,8 @@ class TrackTests(unittest.TestCase):
         self.assertIn("⏭ Пропускаю Z (1ч) — пробой свечой-обвалом", texts[3])
 
     def test_silent_without_channel(self):
-        d, _ = self.open_trade()
+        with mock.patch.object(C, "DUEL_CHAT", ""):
+            d, _ = self.open_trade()
         self.assertEqual(d["outbox"], [])
 
     def test_one_trade_per_coin(self):
